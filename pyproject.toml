@@ -28,7 +28,7 @@ Documentation = "https://github.com/nawka12/ComfyUI-Adept-Sampler/wiki"
 "Bug Tracker" = "https://github.com/nawka12/ComfyUI-Adept-Sampler/issues"
 
 [tool.comfy]
-PublisherId = ""
+PublisherId = "kayfahaarukku"
 DisplayName = "ComfyUI-Adept-Sampler"
 Icon = ""
 includes = [] 
