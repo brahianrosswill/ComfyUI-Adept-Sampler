@@ -18,6 +18,8 @@ from .utils import (
     sa_solver_step,
     get_ancestral_step,
     create_detail_enhanced_model,
+    apply_combat_cfg_drift,
+    apply_cfg_techniques,
     TORCHVISION_AVAILABLE,
 )
 
@@ -293,10 +295,112 @@ def sample_adept_ancestral_solver(model, x, sigmas, extra_args=None, callback=No
     return x
 
 
+def sample_mirror_correction_euler(model, x, sigmas, extra_args=None, callback=None, disable=None,
+                                    eta=1.0, s_noise=1.0, correction_phase=0.5, smooth_phase=False):
+    """
+    Mirror Correction Euler: plain Euler Ancestral with a semantic reflection probe.
+
+    In the first `correction_phase` fraction of steps, uses a 3-call Heun correction:
+      x_probe = 2*D(x) - x  (reflection of x through its own denoised prediction)
+    Unlike a naive -x probe (where x terms cancel), this probe lies on the denoising
+    trajectory, giving a meaningful curvature estimate for the Heun correction.
+
+    Remaining steps: standard 1-call Euler Ancestral. Ancestral noise at every step.
+
+    Args:
+        eta: Ancestral noise coefficient. 0=deterministic, 1=full ancestral. Default: 1.0
+        s_noise: Noise scale multiplier. Default: 1.0
+        correction_phase: Fraction of steps that get the 3-call correction.
+            0.0=no correction (plain Euler a), 1.0=all steps. Default: 0.5
+        smooth_phase: If True, replaces binary cutoff with continuous log-sigma weight
+            scaled by gradient agreement for smoother phase transitions. Default: False
+    """
+    extra_args = {} if extra_args is None else extra_args
+    s_in = x.new_ones([x.shape[0]])
+
+    print(f"🔮 Mirror Correction Euler active (η: {eta:.2f}, s_noise: {s_noise:.2f})")
+    print(f"   Correction Phase: {correction_phase:.2f}, Smooth Phase: {smooth_phase}")
+
+    noise_sampler = get_noise_sampler(x)
+    n_steps = len(sigmas) - 1
+
+    # Pre-compute log-sigma bounds for smooth phase mode
+    log_sigma_phase = None
+    log_sigma_max = None
+    smooth_denom = 1e-6
+    if smooth_phase and n_steps > 0:
+        sigma_max_val = sigmas[0].clamp(min=1e-6)
+        phase_idx = min(int(correction_phase * n_steps), n_steps - 1)
+        sigma_phase_val = sigmas[phase_idx].clamp(min=1e-6)
+        log_sigma_max = torch.log(sigma_max_val).item()
+        log_sigma_phase = torch.log(sigma_phase_val).item()
+        smooth_denom = max(log_sigma_max - log_sigma_phase, 1e-6)
+
+    for i in range(n_steps):
+        sigma = sigmas[i]
+        sigma_next = sigmas[i + 1]
+        progress = i / max(n_steps - 1, 1)
+
+        denoised = model(x, sigma * s_in, **extra_args)
+        if callback is not None:
+            callback(i, denoised, x, n_steps)
+
+        d = to_d(x, sigma, denoised)
+
+        # Ancestral step decomposition (standard formula)
+        if sigma_next > 0:
+            sigma_up = min(sigma_next, eta * (sigma_next ** 2 * (sigma ** 2 - sigma_next ** 2) / sigma ** 2) ** 0.5)
+            sigma_down = (sigma_next ** 2 - sigma_up ** 2) ** 0.5
+        else:
+            sigma_up = 0.0
+            sigma_down = 0.0
+        dt = sigma_down - sigma
+
+        if smooth_phase and log_sigma_phase is not None:
+            # Smooth mode: log-sigma weight + gradient stability + soft blend
+            log_sig = torch.log(sigma.clamp(min=1e-6)).item()
+            t = max(0.0, min(1.0, (log_sig - log_sigma_phase) / smooth_denom))
+            correction_weight = t ** 0.5  # sqrt curve: steep early, shallow near phase_end
+
+            if correction_weight > 1e-3 and sigma_next > 0:
+                x_probe = 2 * denoised - x
+                d_probe = to_d(x_probe, sigma, model(x_probe, sigma * s_in, **extra_args))
+
+                d_diff_norm = (d - d_probe).norm()
+                d_scale = (d.norm() + d_probe.norm()) / 2 + 1e-6
+                gradient_agreement = max(0.0, 1.0 - (d_diff_norm / d_scale).item())
+
+                effective_weight = correction_weight * gradient_agreement
+
+                if effective_weight > 1e-3:
+                    x3 = x + ((d + d_probe) / 2) * dt
+                    d3 = to_d(x3, sigma, model(x3, sigma * s_in, **extra_args))
+                    d_heun = (d + d3) / 2
+                    if not (torch.isnan(d_heun).any() or torch.isinf(d_heun).any()):
+                        d = d + effective_weight * (d_heun - d)  # soft blend
+        else:
+            # Binary mode: exact original behavior
+            if progress < correction_phase and sigma_next > 0:
+                x_probe = 2 * denoised - x
+                d_probe = to_d(x_probe, sigma, model(x_probe, sigma * s_in, **extra_args))
+                x3 = x + ((d + d_probe) / 2) * dt
+                d3 = to_d(x3, sigma, model(x3, sigma * s_in, **extra_args))
+                d = (d + d3) / 2
+                if torch.isnan(d).any() or torch.isinf(d).any():
+                    d = torch.zeros_like(d)
+
+        x = x + d * dt
+        if sigma_next > 0:
+            x = x + noise_sampler(sigma, sigma_next) * s_noise * sigma_up
+
+    return x
+
+
 def sample_akashic_solver(model, x, sigmas, extra_args=None, callback=None, disable=None,
                            tau=0.5, eta=1.0, s_noise=1.0, adaptive_eta=True, phase_strength=0.5,
                            order=2, smea_strength=0.0, ndb_strength=0.0,
-                           use_detail_enhancement=False, settings=None, eqvae_mode='Off'):
+                           use_detail_enhancement=False, settings=None, eqvae_mode='Off',
+                           combat_cfg_drift=False, combat_drift_intensity=0.5):
     """
     AkashicSolver v2 [EXPERIMENTAL]: Advanced sampler optimized for EQ-VAE models.
 
@@ -330,6 +434,8 @@ def sample_akashic_solver(model, x, sigmas, extra_args=None, callback=None, disa
         print(f"   SMEA: {smea_strength:.2f} (high-res coherency)")
     if ndb_strength > 0:
         print(f"   Native Detail Boost: {ndb_strength:.2f} (detail enhancement)")
+    if combat_cfg_drift:
+        print(f"   ✨ Combat CFG Drift: On (intensity: {combat_drift_intensity:.2f})")
     if not eqvae_enabled:
         print(f"   ⚠️ Use external rescaleCFG (e.g., 0.7) for EQ-VAE models")
     
@@ -393,7 +499,11 @@ def sample_akashic_solver(model, x, sigmas, extra_args=None, callback=None, disa
         cfg_scale = extra_args.get('cond_scale', 1.0)
         if cfg_scale > 7.0:
             denoised = apply_dynamic_thresholding(denoised, percentile=0.995)
-        
+
+        # === POST-HOC CFG FIXES (Combat Drift) ===
+        if combat_cfg_drift:
+            denoised = apply_combat_cfg_drift(denoised, intensity=combat_drift_intensity)
+
         # === COMPUTE DERIVATIVE ===
         d = to_d(x, sigma, denoised)
         

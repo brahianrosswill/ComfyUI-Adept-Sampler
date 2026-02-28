@@ -7,6 +7,8 @@ from .adept_schedulers import (
     create_aos_v_sigmas,
     create_aos_e_sigmas,
     create_aos_akashic_sigmas,
+    create_aos_akashic_alt_sigmas,
+    create_akashic_eqflow_sigmas,
     create_entropic_sigmas,
     create_jys_sigmas,
     create_snr_optimized_sigmas,
@@ -96,6 +98,70 @@ class AdeptSchedulerAkashicAOS:
         device = model.load_device
         
         sigmas = create_aos_akashic_sigmas(sigma_max, sigma_min, steps, device)
+        return (sigmas,)
+
+
+class AdeptSchedulerAkashicAOSAlt:
+    """
+    AkashicAOS Alt: Karras-based schedule with stronger detail bias for EQ-VAE.
+
+    Improvements over AkashicAOS:
+    - Stronger detail-progressive bias (power=0.78 vs 0.85)
+    - Shifted tanh crossover at t=0.55 for EQ-VAE's information-gain peak
+    - Adaptive rho scales with step count
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
+            }
+        }
+
+    RETURN_TYPES = ("SIGMAS",)
+    FUNCTION = "get_sigmas"
+    CATEGORY = "sampling/adept/schedulers"
+
+    def get_sigmas(self, model, steps):
+        sigma_min = model.get_model_object("model_sampling").sigma_min
+        sigma_max = model.get_model_object("model_sampling").sigma_max
+        device = model.load_device
+
+        sigmas = create_aos_akashic_alt_sigmas(sigma_max, sigma_min, steps, device)
+        return (sigmas,)
+
+
+class AdeptSchedulerAkashicEQFlow:
+    """
+    AkashicEQFlow: Crossover-focused log-SNR schedule for EQ-VAE models.
+
+    Concentrates steps around the structure-to-detail transition with:
+    - Robust hybrid Karras/logSNR blending for high-step stability
+    - Asymmetric density that keeps both tails alive
+    - Ratio cap + slew-rate limiting for multi-step solver safety
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
+            }
+        }
+
+    RETURN_TYPES = ("SIGMAS",)
+    FUNCTION = "get_sigmas"
+    CATEGORY = "sampling/adept/schedulers"
+
+    def get_sigmas(self, model, steps):
+        sigma_min = model.get_model_object("model_sampling").sigma_min
+        sigma_max = model.get_model_object("model_sampling").sigma_max
+        device = model.load_device
+
+        sigmas = create_akashic_eqflow_sigmas(sigma_max, sigma_min, steps, device)
         return (sigmas,)
 
 
@@ -232,6 +298,8 @@ class AdeptSchedulerAdvanced:
             "AOS-V": lambda: create_aos_v_sigmas(sigma_max, sigma_min, steps, device),
             "AOS-ε": lambda: create_aos_e_sigmas(sigma_max, sigma_min, steps, device),
             "AkashicAOS": lambda: create_aos_akashic_sigmas(sigma_max, sigma_min, steps, device),
+            "AkashicAOS Alt": lambda: create_aos_akashic_alt_sigmas(sigma_max, sigma_min, steps, device),
+            "AkashicEQFlow": lambda: create_akashic_eqflow_sigmas(sigma_max, sigma_min, steps, device),
             "Entropic": lambda: create_entropic_sigmas(sigma_max, sigma_min, steps, entropic_power, device),
             "SNR-Optimized": lambda: create_snr_optimized_sigmas(sigma_max, sigma_min, steps, device),
             "Constant-Rate": lambda: create_constant_rate_sigmas(sigma_max, sigma_min, steps, device),
@@ -256,6 +324,8 @@ NODE_CLASS_MAPPINGS = {
     "AdeptSchedulerAOS_V": AdeptSchedulerAOS_V,
     "AdeptSchedulerAOS_E": AdeptSchedulerAOS_E,
     "AdeptSchedulerAkashicAOS": AdeptSchedulerAkashicAOS,
+    "AdeptSchedulerAkashicAOSAlt": AdeptSchedulerAkashicAOSAlt,
+    "AdeptSchedulerAkashicEQFlow": AdeptSchedulerAkashicEQFlow,
     "AdeptSchedulerEntropic": AdeptSchedulerEntropic,
     "AdeptSchedulerJYS": AdeptSchedulerJYS,
     "AdeptSchedulerAYS": AdeptSchedulerAYS,
@@ -267,6 +337,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AdeptSchedulerAOS_V": "Adept Scheduler (AOS-V)",
     "AdeptSchedulerAOS_E": "Adept Scheduler (AOS-ε)",
     "AdeptSchedulerAkashicAOS": "Adept Scheduler (AkashicAOS)",
+    "AdeptSchedulerAkashicAOSAlt": "Adept Scheduler (AkashicAOS Alt)",
+    "AdeptSchedulerAkashicEQFlow": "Adept Scheduler (AkashicEQFlow)",
     "AdeptSchedulerEntropic": "Adept Scheduler (Entropic)",
     "AdeptSchedulerJYS": "Adept Scheduler (JYS)",
     "AdeptSchedulerAYS": "Adept Scheduler (AYS-SDXL)",

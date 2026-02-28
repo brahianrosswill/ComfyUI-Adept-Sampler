@@ -8,7 +8,9 @@ from .adept_samplers import (
     sample_adept_solver,
     sample_adept_ancestral_solver,
     sample_akashic_solver,
+    sample_mirror_correction_euler,
 )
+from .utils import apply_spectral_modulation_clybius
 
 
 class AdeptSolverSampler:
@@ -134,6 +136,8 @@ class AkashicSolverSampler:
                 "phase_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.1}),
                 "smea_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.1}),
                 "ndb_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "combat_cfg_drift": ("BOOLEAN", {"default": False}),
+                "combat_drift_intensity": ("FLOAT", {"default": 0.5, "min": 0.1, "max": 1.0, "step": 0.05}),
                 "use_detail_enhancement": ("BOOLEAN", {"default": False}),
                 "detail_strength": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "detail_radius": ("FLOAT", {"default": 0.5, "min": 0.1, "max": 2.0, "step": 0.1}),
@@ -146,6 +150,7 @@ class AkashicSolverSampler:
 
     def get_sampler(self, tau, eta, s_noise, order, adaptive_eta, eqvae_mode,
                     phase_strength=0.5, smea_strength=0.0, ndb_strength=0.0,
+                    combat_cfg_drift=False, combat_drift_intensity=0.5,
                     use_detail_enhancement=False, detail_strength=0.05, detail_radius=0.5):
         settings = {
             'detail_enhancement_strength': detail_strength,
@@ -166,9 +171,112 @@ class AkashicSolverSampler:
                 'use_detail_enhancement': use_detail_enhancement,
                 'settings': settings,
                 'eqvae_mode': eqvae_mode,
+                'combat_cfg_drift': combat_cfg_drift,
+                'combat_drift_intensity': combat_drift_intensity,
             }
         )
         return (sampler,)
+
+
+class MirrorCorrectionEulerSampler:
+    """
+    Mirror Correction Euler: Euler Ancestral with a semantic reflection probe.
+
+    In the first `correction_phase` fraction of steps, uses a 3-call Heun correction:
+      x_probe = 2·D(x) − x  (reflection of x through its own denoised prediction)
+    Unlike a naive -x probe, this probe lies on the denoising trajectory, giving a
+    meaningful curvature estimate. Remaining steps are standard Euler Ancestral.
+
+    Optional Smooth Phase Decay mode replaces the binary cutoff with a continuous
+    log-sigma weight modulated by gradient agreement for smoother transitions.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "eta": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
+                "s_noise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
+                "correction_phase": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "smooth_phase": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    RETURN_TYPES = ("SAMPLER",)
+    FUNCTION = "get_sampler"
+    CATEGORY = "sampling/adept/samplers"
+
+    def get_sampler(self, eta, s_noise, correction_phase, smooth_phase):
+        sampler = KSAMPLER(
+            sample_mirror_correction_euler,
+            extra_options={
+                'eta': eta,
+                's_noise': s_noise,
+                'correction_phase': correction_phase,
+                'smooth_phase': smooth_phase,
+            }
+        )
+        return (sampler,)
+
+
+class AdeptSpectralModulation:
+    """
+    Spectral Modulation (Clybius): Frequency-domain CFG correction.
+
+    Patches the model's CFG function to apply spectral modulation to the
+    noise prediction (cond - uncond) before CFG scaling. This emphasizes
+    high-frequency components for sharper, more detailed outputs.
+
+    Based on ComfyUI-Latent-Modifiers by Clybius.
+
+    Recommended for use with AkashicSolver on EQ-VAE models when needed.
+    Connect the output MODEL to your sampler node.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1}),
+                "percentile": ("FLOAT", {"default": 5.0, "min": 1.0, "max": 15.0, "step": 0.5}),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    CATEGORY = "sampling/adept/samplers"
+
+    def patch(self, model, strength, percentile):
+        m = model.clone()
+
+        def spectral_cfg_function(args):
+            cond = args["cond"]
+            uncond = args["uncond"]
+            cond_scale = args["cond_scale"]
+            sigma = args["sigma"]
+            x_orig = args["input"]
+
+            # Reshape sigma for broadcasting
+            sigma = sigma.view(sigma.shape[:1] + (1,) * (cond.ndim - 1))
+
+            # Convert to v-pred space (from RescaleCFG reference)
+            x = x_orig / (sigma * sigma + 1.0)
+            cond_v = ((x - (x_orig - cond)) * (sigma ** 2 + 1.0) ** 0.5) / sigma
+            uncond_v = ((x - (x_orig - uncond)) * (sigma ** 2 + 1.0) ** 0.5) / sigma
+
+            # Compute and modulate noise prediction
+            noise_pred = cond_v - uncond_v
+            noise_pred_modulated = apply_spectral_modulation_clybius(noise_pred, strength, percentile)
+
+            # Compute CFG with modulated noise prediction
+            x_cfg = uncond_v + cond_scale * noise_pred_modulated
+
+            # Convert back from v-pred space
+            return x_orig - (x - x_cfg * sigma / (sigma * sigma + 1.0) ** 0.5)
+
+        m.set_model_sampler_cfg_function(spectral_cfg_function)
+        return (m,)
 
 
 class KSAMPLER:
@@ -208,10 +316,14 @@ NODE_CLASS_MAPPINGS = {
     "AdeptSolverSampler": AdeptSolverSampler,
     "AdeptAncestralSampler": AdeptAncestralSampler,
     "AkashicSolverSampler": AkashicSolverSampler,
+    "MirrorCorrectionEulerSampler": MirrorCorrectionEulerSampler,
+    "AdeptSpectralModulation": AdeptSpectralModulation,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AdeptSolverSampler": "Adept Solver Sampler",
     "AdeptAncestralSampler": "Adept Ancestral Sampler",
     "AkashicSolverSampler": "AkashicSolver v2 [EXPERIMENTAL]",
+    "MirrorCorrectionEulerSampler": "Mirror Correction Euler Sampler",
+    "AdeptSpectralModulation": "Adept Spectral Modulation (CFG)",
 }

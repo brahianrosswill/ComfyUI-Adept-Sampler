@@ -416,6 +416,103 @@ def get_ancestral_step(sigma, sigma_next, eta=1.):
     return sigma_down, sigma_up
 
 
+def apply_spectral_modulation_clybius(noise_pred, multiplier=1.0, percentile=5.0):
+    """
+    Clybius Spectral Modulation: Apply frequency-domain corrections to noise prediction.
+
+    Based on ComfyUI-Latent-Modifiers. Applied to noise_pred (cond - uncond),
+    NOT to the denoised latent directly.
+
+    Args:
+        noise_pred: The noise prediction tensor (cond - uncond)
+        multiplier: Modulation strength (0=none, 1=full Clybius effect). Default: 1.0
+        percentile: Upper/lower percentile threshold. Default: 5.0
+
+    Returns:
+        Spectrally modulated noise prediction
+    """
+    if multiplier == 0 or percentile <= 0:
+        return noise_pred
+
+    try:
+        fourier = torch.fft.fft2(noise_pred, dim=(-2, -1))
+        log_amp = torch.log(torch.sqrt(fourier.real ** 2 + fourier.imag ** 2) + 1e-8)
+
+        log_amp_flat = log_amp.abs().flatten(2)
+        quantile_low = torch.quantile(log_amp_flat, percentile * 0.01, dim=2)
+        quantile_high = torch.quantile(log_amp_flat, 1 - percentile * 0.01, dim=2)
+
+        quantile_low = quantile_low.unsqueeze(-1).unsqueeze(-1).expand(log_amp.shape)
+        quantile_high = quantile_high.unsqueeze(-1).unsqueeze(-1).expand(log_amp.shape)
+
+        mask_low = ((log_amp < quantile_low).float() + 1).clamp_(max=1.5)
+        mask_high = ((log_amp < quantile_high).float()).clamp_(min=0.5)
+
+        filtered_fourier = fourier * ((mask_low * mask_high) ** multiplier)
+        result = torch.fft.ifft2(filtered_fourier, dim=(-2, -1)).real
+
+        return result
+
+    except Exception as e:
+        print(f"⚠️ Spectral modulation failed: {e}")
+        return noise_pred
+
+
+def apply_combat_cfg_drift(latent, method='mean', intensity=1.0):
+    """
+    Combat CFG Drift: Reduce mean drift from high CFG values.
+
+    Based on ComfyUI-Latent-Modifiers. As CFG increases, the latent mean
+    can drift away from 0, causing color shifts and other artifacts.
+
+    Note: Disable for inpaint/ADetailer passes to prevent patchy composites.
+
+    Args:
+        latent: The latent tensor to correct
+        method: 'mean' or 'median'. Default: 'mean'
+        intensity: How much drift to remove (0=none, 1=full). Default: 1.0
+
+    Returns:
+        Drift-corrected latent
+    """
+    if intensity <= 0:
+        return latent
+
+    try:
+        if method == 'median':
+            center = latent.view(latent.shape[0], -1).median(dim=-1, keepdim=True)[0]
+            center = center.view(latent.shape[0], 1, 1, 1)
+        else:
+            center = latent.mean(dim=(1, 2, 3), keepdim=True)
+
+        return latent - center * intensity
+
+    except Exception as e:
+        print(f"⚠️ Combat CFG drift failed: {e}")
+        return latent
+
+
+def apply_cfg_techniques(denoised, settings):
+    """
+    Apply enabled post-hoc CFG techniques to the denoised prediction.
+
+    Spectral Modulation is handled separately via the AdeptSpectralModulation
+    model patch node. This function handles Combat CFG Drift only.
+
+    Args:
+        denoised: The denoised prediction from the model
+        settings: Dict with 'combat_cfg_drift' (bool) and 'combat_drift_intensity' (float)
+
+    Returns:
+        Enhanced denoised result
+    """
+    if not settings.get('combat_cfg_drift', False):
+        return denoised
+
+    intensity = settings.get('combat_drift_intensity', 0.5)
+    return apply_combat_cfg_drift(denoised, method='mean', intensity=intensity)
+
+
 def create_detail_enhanced_model(model, x, sigmas, settings):
     """Creates a model wrapper with detail enhancement."""
     if not TORCHVISION_AVAILABLE:

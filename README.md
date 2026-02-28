@@ -6,22 +6,30 @@ Advanced custom samplers and schedulers for ComfyUI, ported from the Stable Diff
 
 ## Features
 
-### Samplers (3)
+### Samplers (4)
 
 | Sampler | Description |
 |---------|-------------|
 | **Adept Solver** | Hybrid **Predictor-Corrector** pipeline using Adams-Bashforth integration (DEIS) with UniPC correction steps and dynamic thresholding |
 | **Adept Ancestral Solver** | **Enhanced Euler Ancestral** with phase-dependent step sizing, adaptive noise injection (Eta), and context-aware derivative corrections |
-| **AkashicSolver v2** | **SA-Solver** (Stochastic Adams) implementation integrated with **SMEA** (Sinusoidal Multipass) interpolation for high-res coherence |
+| **AkashicSolver v2** | **SA-Solver** (Stochastic Adams) implementation integrated with **SMEA** (Sinusoidal Multipass) interpolation for high-res coherence, EQ-VAE mode, and Combat CFG Drift |
+| **Mirror Correction Euler** | **Euler Ancestral with semantic reflection probe**. Uses a 3-call Heun correction (x_probe = 2·D(x) − x) in the first `correction_phase` fraction of steps for improved curvature estimation. Optional smooth phase decay mode |
 
-### Schedulers (17+)
+### CFG Fix Nodes (1)
+
+| Node | Description |
+|------|-------------|
+| **Adept Spectral Modulation (CFG)** | Patches the model's CFG function to apply **Clybius Spectral Modulation** (frequency-domain correction) to the noise prediction. Connect MODEL → MODEL before your sampler. Based on ComfyUI-Latent-Modifiers |
+
+### Schedulers (19+)
 
 | Category | Schedulers |
 |----------|-----------|
-| **Anime-Optimized** | AOS-V (v-prediction), AOS-ε (epsilon), AkashicAOS (Continuous Power-Function) |
+| **Anime-Optimized** | AOS-V (v-prediction), AOS-ε (epsilon) |
+| **EQ-VAE / Akashic** | AkashicAOS (Continuous Power-Function), AkashicAOS Alt (stronger detail bias), AkashicEQFlow (crossover-focused log-SNR) |
 | **Research-Based** | AYS-SDXL (Align Your Steps), JYS (Jump Your Steps), SNR-Optimized |
-| **General Purpose** | Entropic, Cosine-Annealed, LogSNR-Uniform, Constant-Rate |
-| **Experimental** | Stochastic, Jittered-Karras, Tanh Mid-Boost, Exponential Tail |
+| **General Purpose** | Entropic, Cosine-Annealed, LogSNR-Uniform, Constant-Rate, Adaptive-Optimized |
+| **Experimental** | Stochastic, Jittered-Karras, Hybrid JYS-Karras, Tanh Mid-Boost, Exponential Tail |
 
 ## Installation
 
@@ -60,6 +68,16 @@ Connect a sampler node to use custom sampling algorithms:
                                 [Adept Solver Sampler]
 ```
 
+### Using Spectral Modulation
+
+Patch the model before passing it to SamplerCustom:
+
+```
+[Load Checkpoint] → [Adept Spectral Modulation (CFG)] → [SamplerCustom] → [VAE Decode]
+                                                               ↑
+                                                        [Sampler Node]
+```
+
 ## Node Reference
 
 ### Scheduler Nodes
@@ -71,6 +89,8 @@ All scheduler nodes take a `MODEL` input and output `SIGMAS`.
 | **Adept Scheduler (AOS-V)** | steps |
 | **Adept Scheduler (AOS-ε)** | steps |
 | **Adept Scheduler (AkashicAOS)** | steps |
+| **Adept Scheduler (AkashicAOS Alt)** | steps |
+| **Adept Scheduler (AkashicEQFlow)** | steps |
 | **Adept Scheduler (Entropic)** | steps, power |
 | **Adept Scheduler (JYS)** | steps |
 | **Adept Scheduler (AYS-SDXL)** | steps |
@@ -85,7 +105,14 @@ All sampler nodes output `SAMPLER` for use with SamplerCustom.
 |------|----------------|
 | **Adept Solver Sampler** | order (1-3), use_corrector, detail enhancement options |
 | **Adept Ancestral Sampler** | eta, s_noise, adaptive_eta, phase_noise, enhanced_derivative |
-| **AkashicSolver v2** | tau (0-1), eta, s_noise, order, adaptive_eta, smea_strength, ndb_strength (High-Frequency Injection) |
+| **AkashicSolver v2** | tau (0-1), eta, s_noise, order, adaptive_eta, smea_strength, ndb_strength, eqvae_mode, combat_cfg_drift, combat_drift_intensity |
+| **Mirror Correction Euler Sampler** | eta, s_noise, correction_phase (0-1), smooth_phase |
+
+### CFG Fix Nodes
+
+| Node | Key Parameters | Input → Output |
+|------|----------------|----------------|
+| **Adept Spectral Modulation (CFG)** | strength (0-2), percentile (1-15) | MODEL → MODEL |
 
 ## Recommended Settings
 
@@ -98,9 +125,14 @@ All sampler nodes output `SAMPLER` for use with SamplerCustom.
 - Sampler: **Adept Ancestral** (eta=1.0, adaptive_eta=on)
 
 ### For EQ-VAE models (e.g., AkashicPulse)
-- Scheduler: **AkashicAOS**
-- Sampler: **AkashicSolver v2** (tau=0.5, order=2) - *Uses SA-Solver to manage stochasticity in smooth latent spaces*
-- **Important**: Use external rescaleCFG (0.7) for best results
+- Scheduler: **AkashicAOS**, **AkashicAOS Alt**, or **AkashicEQFlow**
+- Sampler: **AkashicSolver v2** (tau=0.5-0.6, order=2, eqvae_mode=Balanced)
+- Optional: add **Adept Spectral Modulation** and/or enable **Combat CFG Drift**
+
+### Mirror Correction Euler
+- Scheduler: Any (Karras, AOS-ε, AkashicAOS)
+- correction_phase=0.3–0.5 is a good starting point
+- Enable smooth_phase for EQ-VAE smooth latents
 
 ## Credits
 

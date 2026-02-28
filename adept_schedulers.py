@@ -468,19 +468,180 @@ def create_ays_sdxl_sigmas(sigma_max, sigma_min, num_steps, device='cpu'):
     
     sigmas[0] = sigma_max
     sigmas[-1] = 0.0
-    
+
     for i in range(1, len(sigmas) - 1):
         if sigmas[i] >= sigmas[i-1]:
             sigmas[i] = sigmas[i-1] * 0.999
-    
+
     return sigmas
+
+
+def create_aos_akashic_alt_sigmas(sigma_max, sigma_min, num_steps, device='cpu'):
+    """
+    AkashicAOS Alt: Karras-based schedule with EQ-VAE-tuned warping.
+
+    Uses Karras sigma mapping with EQ-VAE-specific warping:
+    - Stronger detail-progressive bias (power=0.78 vs 0.85 in AkashicAOS)
+    - Shifted tanh crossover at t=0.55 (vs sinusoidal mid-boost at t=0.5)
+    - Adaptive rho scales with step count
+
+    Step-count adaptive: higher rho at low counts (detail-focused),
+    closer to standard at high counts so extra steps stay meaningful.
+    """
+    if num_steps <= 0:
+        return torch.zeros(1, device=device)
+
+    # Adaptive rho: higher at low step counts to concentrate on detail phase
+    rho = min(11.0, max(7.0, 7.0 + 2.0 * (20.0 / max(num_steps, 10))))
+
+    u = torch.linspace(0, 1, num_steps, device=device)
+
+    # Power < 1 shifts density toward low sigma (detail phase)
+    # 0.78 = stronger detail bias than AkashicAOS's 0.85
+    detail_power = 0.78
+    u_detail = u ** detail_power
+
+    # Shifted crossover concentration at t=0.55 using tanh
+    # Matches EQ-VAE's information-gain peak (offset from t=0.5)
+    t_center = 0.55
+    beta = 0.07
+    gamma = 4.0
+    crossover = beta * torch.tanh(gamma * (u - t_center))
+
+    u_modulated = u_detail + crossover
+
+    # Normalize to [0, 1]
+    u_min, u_max = u_modulated.min(), u_modulated.max()
+    if u_max - u_min > 1e-8:
+        u_modulated = (u_modulated - u_min) / (u_max - u_min)
+
+    # Karras sigma mapping: linear interpolation in sigma^(1/rho) space
+    min_inv_rho = sigma_min ** (1 / rho)
+    max_inv_rho = sigma_max ** (1 / rho)
+    sigmas = (max_inv_rho + u_modulated * (min_inv_rho - max_inv_rho)) ** rho
+
+    # Step ratio smoothing for multi-step solver stability
+    max_ratio = 1.5
+    for i in range(1, len(sigmas)):
+        if sigmas[i] >= sigmas[i - 1]:
+            sigmas[i] = sigmas[i - 1] * 0.995
+        if sigmas[i - 1] / sigmas[i].clamp(min=1e-10) > max_ratio:
+            sigmas[i] = sigmas[i - 1] / max_ratio
+
+    return torch.cat([sigmas, torch.zeros(1, device=device)])
+
+
+def create_akashic_eqflow_sigmas(sigma_max, sigma_min, num_steps, device='cpu'):
+    """
+    AkashicEQFlow: Robust crossover-focused log-SNR schedule for EQ-VAE models.
+
+    Concentrates steps around the structure-to-detail transition in logSNR space,
+    blended with a Karras prior for stability:
+    - Milder crossover concentration for high-step stability
+    - Adaptive width with minimum floor (avoids narrow spikes)
+    - Asymmetric but restrained detail-side emphasis
+    - Hybrid blend with Karras prior in lambda space
+    - Ratio cap + ratio slew-rate limiting for multi-step stability
+    """
+    if num_steps <= 0:
+        return torch.zeros(1, device=device)
+
+    # Log-SNR endpoints
+    lambda_min = -2.0 * math.log(max(float(sigma_max), 1e-10))  # noisiest
+    lambda_max = -2.0 * math.log(max(float(sigma_min), 1e-10))  # cleanest
+    lambda_range = max(lambda_max - lambda_min, 1e-8)
+
+    # Adaptive center shift (mild) — keep near crossover with conservative detailward shift
+    step_factor = min(1.0, max(0.0, (num_steps - 16) / 30.0))
+    lambda_center = 0.20 + 0.15 * step_factor
+    u_center = (lambda_center - lambda_min) / lambda_range
+    u_center = float(min(0.88, max(0.12, u_center)))
+
+    # Adaptive shape with minimum width floor
+    concentration = min(3.2, max(1.35, 1.1 + num_steps / 16.0))
+    base_width = min(0.30, max(0.18, 0.31 - 0.0028 * num_steps))
+
+    width_left = base_width * 1.06
+    width_right = base_width * 0.94
+    detail_side_gain = 1.08 + 0.04 * step_factor
+
+    # CDF inversion with asymmetric density
+    N = 1200
+    t = torch.linspace(0, 1, N, device=device)
+    delta = t - u_center
+    left_core = torch.exp(-((delta / width_left) ** 2) / 2.0)
+    right_core = detail_side_gain * torch.exp(-((delta / width_right) ** 2) / 2.0)
+    crossover_core = torch.where(delta <= 0, left_core, right_core)
+
+    # Keep both tails alive so crossover never starves composition or refinement
+    detail_floor = 0.08 * (t ** 1.4)
+    composition_floor = 0.05 * ((1 - t) ** 1.7)
+    density = 1.0 + concentration * crossover_core + detail_floor + composition_floor
+
+    # Trapezoidal CDF
+    dt_val = 1.0 / (N - 1)
+    cdf = torch.zeros(N, device=device)
+    cdf[1:] = torch.cumsum((density[:-1] + density[1:]) * 0.5 * dt_val, dim=0)
+    cdf = cdf / cdf[-1].clamp(min=1e-12)
+
+    # Invert CDF
+    targets = torch.linspace(0, 1, num_steps, device=device)
+    indices = torch.searchsorted(cdf, targets).clamp(1, N - 1)
+    lo = indices - 1
+    hi = indices
+    frac = (targets - cdf[lo]) / (cdf[hi] - cdf[lo]).clamp(min=1e-12)
+    u_steps = t[lo] + frac * (t[hi] - t[lo])
+
+    # Log-SNR -> sigma with Karras prior blend
+    lambdas_eqflow = lambda_min + u_steps * lambda_range
+
+    rho = min(10.0, max(7.0, 7.0 + 1.5 * (22.0 / max(num_steps, 12))))
+    u_karras = torch.linspace(0, 1, num_steps, device=device)
+    min_inv_rho = sigma_min ** (1 / rho)
+    max_inv_rho = sigma_max ** (1 / rho)
+    sigmas_karras = (max_inv_rho + u_karras * (min_inv_rho - max_inv_rho)) ** rho
+    lambdas_karras = -2.0 * torch.log(sigmas_karras.clamp(min=1e-10))
+
+    # Higher blend at higher steps: EQFlow character + Karras regularity
+    blend_eqflow = min(0.60, max(0.35, 0.38 + num_steps / 200.0))
+    lambdas = (1.0 - blend_eqflow) * lambdas_karras + blend_eqflow * lambdas_eqflow
+    sigmas = torch.exp(-lambdas / 2.0)
+
+    # Ratio cap + slew-rate limiting for multi-step stability
+    if num_steps >= 40:
+        max_ratio = 1.50
+    elif num_steps >= 28:
+        max_ratio = 1.55
+    elif num_steps >= 18:
+        max_ratio = 1.65
+    else:
+        max_ratio = 1.85
+    ratio_slew = 1.18
+    prev_ratio = None
+
+    sigmas[0] = sigma_max
+    for i in range(1, len(sigmas)):
+        if sigmas[i] >= sigmas[i - 1]:
+            sigmas[i] = sigmas[i - 1] * 0.995
+        ratio = float((sigmas[i - 1] / sigmas[i].clamp(min=1e-10)).item())
+        ratio = min(ratio, max_ratio)
+        if prev_ratio is not None:
+            ratio = min(ratio, prev_ratio * ratio_slew)
+            ratio = max(ratio, prev_ratio / ratio_slew)
+        ratio = max(1.001, ratio)
+        sigmas[i] = sigmas[i - 1] / ratio
+        prev_ratio = ratio
+
+    return torch.cat([sigmas, torch.zeros(1, device=device)])
 
 
 # List of all available schedulers
 SCHEDULER_NAMES = [
     "AOS-V",
-    "AOS-ε", 
+    "AOS-ε",
     "AkashicAOS",
+    "AkashicAOS Alt",
+    "AkashicEQFlow",
     "Entropic",
     "SNR-Optimized",
     "Constant-Rate",
@@ -503,6 +664,8 @@ def get_scheduler_function(name):
         "AOS-V": create_aos_v_sigmas,
         "AOS-ε": create_aos_e_sigmas,
         "AkashicAOS": create_aos_akashic_sigmas,
+        "AkashicAOS Alt": create_aos_akashic_alt_sigmas,
+        "AkashicEQFlow": create_akashic_eqflow_sigmas,
         "Entropic": create_entropic_sigmas,
         "SNR-Optimized": create_snr_optimized_sigmas,
         "Constant-Rate": create_constant_rate_sigmas,
