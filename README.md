@@ -11,9 +11,9 @@ Advanced custom samplers and schedulers for ComfyUI, ported from the Stable Diff
 | Sampler | Description |
 |---------|-------------|
 | **Adept Solver** | Hybrid **Predictor-Corrector** pipeline using Adams-Bashforth integration (DEIS) with UniPC correction steps and dynamic thresholding |
-| **Adept Ancestral Solver** | **Enhanced Euler Ancestral** with phase-dependent step sizing, adaptive noise injection (Eta), and context-aware derivative corrections |
-| **AkashicSolver v2** | **SA-Solver** (Stochastic Adams) implementation integrated with **SMEA** (Sinusoidal Multipass) interpolation for high-res coherence, EQ-VAE mode, and Combat CFG Drift |
-| **Mirror Correction Euler** | **Euler Ancestral with semantic reflection probe**. Uses a 3-call Heun correction (x_probe = 2·D(x) − x) in the first `correction_phase` fraction of steps for improved curvature estimation. Optional smooth phase decay mode |
+| **Adept Ancestral Solver** | **Enhanced Euler Ancestral** with phase-dependent step sizing, adaptive noise injection (Eta), context-aware derivative corrections, and adaptive noise scale |
+| **AkashicSolver v2** | **SA-Solver** (Stochastic Adams) implementation integrated with **SMEA** (Sinusoidal Multipass) interpolation for high-res coherence, EQ-VAE mode, Combat CFG Drift, and adaptive noise scale |
+| **Mirror Correction Euler** | **Euler Ancestral with semantic reflection probe**. Uses a 3-call Heun correction (x_probe = 2·D(x) − x) in the first `correction_phase` fraction of steps for improved curvature estimation. Probe norm limiting for stability. Optional smooth phase decay and adaptive noise scale |
 
 ### CFG Fix Nodes (1)
 
@@ -104,9 +104,9 @@ All sampler nodes output `SAMPLER` for use with SamplerCustom.
 | Node | Key Parameters |
 |------|----------------|
 | **Adept Solver Sampler** | order (1-3), use_corrector, detail enhancement options |
-| **Adept Ancestral Sampler** | eta, s_noise, adaptive_eta, phase_noise, enhanced_derivative |
-| **AkashicSolver v2** | tau (0-1), eta, s_noise, order, adaptive_eta, smea_strength, ndb_strength, eqvae_mode, combat_cfg_drift, combat_drift_intensity |
-| **Mirror Correction Euler Sampler** | eta, s_noise, correction_phase (0-1), smooth_phase |
+| **Adept Ancestral Sampler** | eta, s_noise, adaptive_eta, phase_noise, enhanced_derivative, adaptive_noise |
+| **AkashicSolver v2** | tau (0-1), eta, s_noise, order, adaptive_eta, smea_strength, ndb_strength, eqvae_mode, combat_cfg_drift, combat_drift_intensity, adaptive_noise |
+| **Mirror Correction Euler Sampler** | eta, s_noise, correction_phase (0-1), smooth_phase, adaptive_noise |
 
 ### CFG Fix Nodes
 
@@ -133,6 +133,12 @@ All sampler nodes output `SAMPLER` for use with SamplerCustom.
 - Scheduler: Any (Karras, AOS-ε, AkashicAOS)
 - correction_phase=0.3–0.5 is a good starting point
 - Enable smooth_phase for EQ-VAE smooth latents
+
+### Adaptive Noise Scale
+Available on Mirror Correction Euler, Adept Ancestral, and AkashicSolver. When enabled:
+- Collects noise excess metrics during a warmup phase (texture sigma region 0.5–5.0)
+- After calibration, restarts generation with a per-phase correction factor applied
+- Useful when the default s_noise is over- or under-shooting for a given model
 
 ## Credits
 
