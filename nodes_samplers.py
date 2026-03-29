@@ -117,10 +117,7 @@ class AkashicSolverSampler:
     AkashicSolver v2 [EXPERIMENTAL]: SA-Solver optimized for EQ-VAE models.
 
     Combines SA-Solver multi-step integration with phase-aware adaptation and SMEA coherency.
-
-    EQ-VAE Mode:
-    - Off: Standard mode, use external rescaleCFG (0.7) for EQ-VAE models
-    - Balanced: Optimized for EQ-VAE's cleaner latent space, maintains sharpness
+    Use external rescaleCFG (0.7) for EQ-VAE models.
     """
 
     @classmethod
@@ -132,7 +129,6 @@ class AkashicSolverSampler:
                 "s_noise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
                 "order": ("INT", {"default": 2, "min": 1, "max": 3}),
                 "adaptive_eta": ("BOOLEAN", {"default": True}),
-                "eqvae_mode": (["Off", "Balanced"], {"default": "Off"}),
             },
             "optional": {
                 "phase_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.1}),
@@ -151,7 +147,7 @@ class AkashicSolverSampler:
     FUNCTION = "get_sampler"
     CATEGORY = "sampling/adept/samplers"
 
-    def get_sampler(self, tau, eta, s_noise, order, adaptive_eta, eqvae_mode,
+    def get_sampler(self, tau, eta, s_noise, order, adaptive_eta,
                     phase_strength=0.5, smea_strength=0.0, ndb_strength=0.0,
                     combat_cfg_drift=False, combat_drift_intensity=0.5,
                     adaptive_noise=False,
@@ -174,7 +170,6 @@ class AkashicSolverSampler:
                 'ndb_strength': ndb_strength,
                 'use_detail_enhancement': use_detail_enhancement,
                 'settings': settings,
-                'eqvae_mode': eqvae_mode,
                 'combat_cfg_drift': combat_cfg_drift,
                 'combat_drift_intensity': combat_drift_intensity,
                 'adaptive_noise': adaptive_noise,

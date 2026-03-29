@@ -11,9 +11,6 @@ from .utils import (
     apply_dynamic_thresholding,
     compute_compensation_ratio,
     compute_tau_eqvae,
-    compute_eqvae_tau,
-    compute_eqvae_noise_scale,
-    compute_eqvae_ndb,
     compute_smea_factor,
     sa_solver_step,
     get_ancestral_step,
@@ -488,7 +485,7 @@ def sample_mirror_correction_euler(model, x, sigmas, extra_args=None, callback=N
 def sample_akashic_solver(model, x, sigmas, extra_args=None, callback=None, disable=None,
                            tau=0.5, eta=1.0, s_noise=1.0, adaptive_eta=True, phase_strength=0.5,
                            order=2, smea_strength=0.0, ndb_strength=0.0,
-                           use_detail_enhancement=False, settings=None, eqvae_mode='Off',
+                           use_detail_enhancement=False, settings=None,
                            combat_cfg_drift=False, combat_drift_intensity=0.5,
                            adaptive_noise=False):
     """
@@ -500,25 +497,13 @@ def sample_akashic_solver(model, x, sigmas, extra_args=None, callback=None, disa
     3. SMEA COHERENCY: Sine-based interpolation for high-resolution coherency
 
     Args:
-        eqvae_mode: EQ-VAE optimization mode ('Off' or 'Balanced')
         adaptive_noise: Auto-adjust s_noise based on model behavior. Default: False
     """
     extra_args = {} if extra_args is None else extra_args
     settings = settings or {}
     s_in = x.new_ones([x.shape[0]])
 
-    # Parse EQ-VAE mode setting
-    if isinstance(eqvae_mode, bool):
-        # Backwards compatibility with old boolean setting
-        eqvae_enabled = eqvae_mode
-    else:
-        eqvae_enabled = eqvae_mode == 'Balanced'
-
-    if eqvae_enabled:
-        print(f"🌀 AkashicSolver v2 [EQ-VAE BALANCED] active")
-        print(f"   Optimized for EQ-VAE's cleaner latent space")
-    else:
-        print(f"🌀 AkashicSolver v2 [EXPERIMENTAL] active")
+    print(f"🌀 AkashicSolver v2 [EXPERIMENTAL] active")
     print(f"   τ (tau): {tau:.2f}, η (eta): {eta:.2f}, s_noise: {s_noise:.2f}")
     print(f"   Order: {order}, Adaptive Eta: {adaptive_eta}, Phase Strength: {phase_strength:.2f}")
     if smea_strength > 0:
@@ -529,8 +514,7 @@ def sample_akashic_solver(model, x, sigmas, extra_args=None, callback=None, disa
         print(f"   ✨ Combat CFG Drift: On (intensity: {combat_drift_intensity:.2f})")
     if adaptive_noise:
         print(f"   Adaptive Noise: ON (auto-adjusting s_noise per step)")
-    if not eqvae_enabled:
-        print(f"   ⚠️ Use external rescaleCFG (e.g., 0.7) for EQ-VAE models")
+    print(f"   ⚠️ Use external rescaleCFG (e.g., 0.7) for EQ-VAE models")
 
     # Apply detail enhancement wrapper if enabled
     active_model = model
@@ -560,29 +544,18 @@ def sample_akashic_solver(model, x, sigmas, extra_args=None, callback=None, disa
 
         # === COMPUTE PHASE-AWARE TAU ===
         if adaptive_eta:
-            if eqvae_enabled:
-                current_tau = compute_eqvae_tau(progress, tau, phase_strength)
-            else:
-                current_tau = compute_tau_eqvae(progress, tau, phase_strength)
+            current_tau = compute_tau_eqvae(progress, tau, phase_strength)
         else:
             current_tau = tau
 
         # === PHASE-AWARE ADAPTIVE ETA ===
         if adaptive_eta:
-            if eqvae_enabled:
-                if progress < 0.25:
-                    current_eta = eta * (1.0 + 0.03 * phase_strength)
-                elif progress < 0.55:
-                    current_eta = eta * (1.0 - 0.03 * phase_strength)
-                else:
-                    current_eta = eta * (1.0 + 0.02 * phase_strength)
+            if progress < 0.30:
+                current_eta = eta * (1.0 + 0.08 * phase_strength)
+            elif progress < 0.60:
+                current_eta = eta * (1.0 - 0.05 * phase_strength)
             else:
-                if progress < 0.30:
-                    current_eta = eta * (1.0 + 0.08 * phase_strength)
-                elif progress < 0.60:
-                    current_eta = eta * (1.0 - 0.05 * phase_strength)
-                else:
-                    current_eta = eta * (1.0 + 0.02 * phase_strength)
+                current_eta = eta * (1.0 + 0.02 * phase_strength)
         else:
             current_eta = eta
 
@@ -620,19 +593,16 @@ def sample_akashic_solver(model, x, sigmas, extra_args=None, callback=None, disa
         # === SA-SOLVER STEP WITH TAU CONTROL ===
         effective_tau = current_tau
 
-        if eqvae_enabled:
-            effective_s_noise = compute_eqvae_noise_scale(s_noise * current_eta, progress) * smea_factor
+        effective_s_noise = s_noise * current_eta * smea_factor
+
+        if progress < 0.30:
+            noise_multiplier = 1.0 + 0.03 * phase_strength
+        elif progress < 0.60:
+            noise_multiplier = 1.0 - 0.01 * phase_strength
         else:
-            effective_s_noise = s_noise * current_eta * smea_factor
+            noise_multiplier = 1.0 - 0.02 * phase_strength
 
-            if progress < 0.30:
-                noise_multiplier = 1.0 + 0.03 * phase_strength
-            elif progress < 0.60:
-                noise_multiplier = 1.0 - 0.01 * phase_strength
-            else:
-                noise_multiplier = 1.0 - 0.02 * phase_strength
-
-            effective_s_noise *= noise_multiplier
+        effective_s_noise *= noise_multiplier
 
         # === ADAPTIVE NOISE SCALE (final multiplier) ===
         if adaptive_noise and prev_denoised_raw is not None:
@@ -696,12 +666,6 @@ def sample_akashic_solver(model, x, sigmas, extra_args=None, callback=None, disa
                             continue
                         effective_s_noise *= adaptive_correction
 
-        # Determine NDB parameters (EQ-VAE uses different blur sigma)
-        if eqvae_enabled and ndb_strength > 0:
-            eqvae_blur_sigma, _ = compute_eqvae_ndb(progress, ndb_strength)
-        else:
-            eqvae_blur_sigma = None
-
         # Execute SA-Solver step
         x, sigma_up = sa_solver_step(
             x=x,
@@ -714,8 +678,6 @@ def sample_akashic_solver(model, x, sigmas, extra_args=None, callback=None, disa
             order=order,
             ndb_strength=ndb_strength,
             progress=progress,
-            eqvae_mode=eqvae_enabled,
-            eqvae_blur_sigma=eqvae_blur_sigma
         )
 
         # === ERROR HANDLING ===
