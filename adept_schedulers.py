@@ -27,11 +27,21 @@ def create_aos_v_sigmas(sigma_max, sigma_min, num_steps, device='cpu'):
         torch.linspace(0, 1, num_steps - p2_steps, out=ramp[p2_steps:])
         ramp[p2_steps:].pow_(3).mul_(0.1).add_(0.9)
     
-    min_inv_rho = sigma_min ** (1 / rho)
-    max_inv_rho = sigma_max ** (1 / rho)
-    ramp.mul_(min_inv_rho - max_inv_rho).add_(max_inv_rho).pow_(rho)
-    
-    return torch.cat([ramp, torch.zeros(1, device=device)])
+    if float(sigma_max) <= 1.0:
+        sigmas = sigma_max + ramp * (sigma_min - sigma_max)
+        for i in range(1, len(sigmas)):
+            if sigmas[i] >= sigmas[i - 1]:
+                sigmas[i] = sigmas[i - 1] * 0.999
+    else:
+        min_inv_rho = sigma_min ** (1 / rho)
+        max_inv_rho = sigma_max ** (1 / rho)
+        ramp.mul_(min_inv_rho - max_inv_rho).add_(max_inv_rho).pow_(rho)
+        sigmas = ramp
+        for i in range(1, len(sigmas)):
+            if sigmas[i] >= sigmas[i - 1]:
+                sigmas[i] = sigmas[i - 1] * 0.999
+
+    return torch.cat([sigmas, torch.zeros(1, device=device)])
 
 
 def create_aos_e_sigmas(sigma_max, sigma_min, num_steps, device='cpu'):
@@ -55,10 +65,19 @@ def create_aos_e_sigmas(sigma_max, sigma_min, num_steps, device='cpu'):
 
     ramp = torch.cat([phase1_ramp, phase2_ramp, phase3_ramp])
     
-    min_inv_rho = sigma_min ** (1 / rho)
-    max_inv_rho = sigma_max ** (1 / rho)
-    sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
-    
+    if float(sigma_max) <= 1.0:
+        sigmas = sigma_max + ramp * (sigma_min - sigma_max)
+        for i in range(1, len(sigmas)):
+            if sigmas[i] >= sigmas[i - 1]:
+                sigmas[i] = sigmas[i - 1] * 0.999
+    else:
+        min_inv_rho = sigma_min ** (1 / rho)
+        max_inv_rho = sigma_max ** (1 / rho)
+        sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
+        for i in range(1, len(sigmas)):
+            if sigmas[i] >= sigmas[i - 1]:
+                sigmas[i] = sigmas[i - 1] * 0.999
+
     return torch.cat([sigmas, torch.zeros(1, device=device)])
 
 
@@ -86,10 +105,13 @@ def create_aos_akashic_sigmas(sigma_max, sigma_min, num_steps, device='cpu'):
     if u_max - u_min > 1e-8:
         u_modulated = (u_modulated - u_min) / (u_max - u_min)
     
-    min_inv_rho = sigma_min ** (1 / rho)
-    max_inv_rho = sigma_max ** (1 / rho)
-    sigmas = (max_inv_rho + u_modulated * (min_inv_rho - max_inv_rho)) ** rho
-    
+    if float(sigma_max) <= 1.0:
+        sigmas = sigma_max + u_modulated * (sigma_min - sigma_max)
+    else:
+        min_inv_rho = sigma_min ** (1 / rho)
+        max_inv_rho = sigma_max ** (1 / rho)
+        sigmas = (max_inv_rho + u_modulated * (min_inv_rho - max_inv_rho)) ** rho
+
     # Step ratio smoothing
     for i in range(1, len(sigmas)):
         if sigmas[i] >= sigmas[i-1]:
@@ -104,16 +126,24 @@ def create_aos_akashic_sigmas(sigma_max, sigma_min, num_steps, device='cpu'):
 def create_entropic_sigmas(sigma_max, sigma_min, num_steps, power=3.0, device='cpu'):
     """Entropic power schedule: blends linear with power-based curve."""
     rho = 7.0
-    
+
     linear_ramp = torch.linspace(0, 1, num_steps, device=device)
     power_ramp = 1 - torch.linspace(1, 0, num_steps, device=device) ** power
-    
+
     ramp = (linear_ramp + power_ramp) / 2.0
-    
-    min_inv_rho = sigma_min ** (1 / rho)
-    max_inv_rho = sigma_max ** (1 / rho)
-    sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
-    
+
+    sigma_max_val = float(sigma_max)
+    if sigma_max_val <= 1.0:
+        # Flow-matching models (e.g. Cosmos/Anima) have sigma_max=1.0.
+        # The Karras rho=7 formula collapses at sigma_max=1 (max_inv_rho=1),
+        # causing the first step to drop to ~0.5 and producing a white image.
+        # Apply the entropic ramp directly in sigma-space instead.
+        sigmas = sigma_max + ramp * (sigma_min - sigma_max)
+    else:
+        min_inv_rho = sigma_min ** (1 / rho)
+        max_inv_rho = sigma_max ** (1 / rho)
+        sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
+
     return torch.cat([sigmas, torch.zeros(1, device=device)])
 
 
@@ -133,9 +163,12 @@ def create_snr_optimized_sigmas(sigma_max, sigma_min, num_steps, device='cpu'):
     blend_factor = 0.7
     combined_t = blend_factor * sigmoid_t + (1 - blend_factor) * linear_t
     
-    log_snr = log_snr_max + combined_t * (log_snr_min - log_snr_max)
-    sigmas = torch.exp(log_snr / 2)
-    
+    if float(sigma_max) <= 1.0:
+        sigmas = sigma_max + combined_t * (sigma_min - sigma_max)
+    else:
+        log_snr = log_snr_max + combined_t * (log_snr_min - log_snr_max)
+        sigmas = torch.exp(log_snr / 2)
+
     return torch.cat([sigmas, torch.zeros(1, device=device)])
 
 
@@ -145,11 +178,14 @@ def create_constant_rate_sigmas(sigma_max, sigma_min, num_steps, device='cpu'):
     
     t = torch.linspace(0, 1, num_steps, device=device)
     corrected_t = t + 0.3 * torch.sin(math.pi * t) * (1 - t)
-    
-    min_inv_rho = sigma_min ** (1 / rho)
-    max_inv_rho = sigma_max ** (1 / rho)
-    sigmas = (max_inv_rho + corrected_t * (min_inv_rho - max_inv_rho)) ** rho
-    
+
+    if float(sigma_max) <= 1.0:
+        sigmas = sigma_max + corrected_t * (sigma_min - sigma_max)
+    else:
+        min_inv_rho = sigma_min ** (1 / rho)
+        max_inv_rho = sigma_max ** (1 / rho)
+        sigmas = (max_inv_rho + corrected_t * (min_inv_rho - max_inv_rho)) ** rho
+
     return torch.cat([sigmas, torch.zeros(1, device=device)])
 
 
@@ -171,11 +207,14 @@ def create_adaptive_optimized_sigmas(sigma_max, sigma_min, num_steps, device='cp
     
     if (combined_t.max() - combined_t.min()) > 1e-6:
         combined_t = (combined_t - combined_t.min()) / (combined_t.max() - combined_t.min())
-    
-    min_inv_rho = sigma_min ** (1 / rho)
-    max_inv_rho = sigma_max ** (1 / rho)
-    sigmas = (max_inv_rho + combined_t * (min_inv_rho - max_inv_rho)) ** rho
-    
+
+    if float(sigma_max) <= 1.0:
+        sigmas = sigma_max + combined_t * (sigma_min - sigma_max)
+    else:
+        min_inv_rho = sigma_min ** (1 / rho)
+        max_inv_rho = sigma_max ** (1 / rho)
+        sigmas = (max_inv_rho + combined_t * (min_inv_rho - max_inv_rho)) ** rho
+
     return torch.cat([sigmas, torch.zeros(1, device=device)])
 
 
@@ -184,9 +223,12 @@ def create_cosine_sigmas(sigma_max, sigma_min, num_steps, device='cpu'):
     rho = 7.0
     u = torch.linspace(0, 1, num_steps, device=device)
     t = (1 - torch.cos(math.pi * u)) / 2
-    min_inv_rho = sigma_min ** (1 / rho)
-    max_inv_rho = sigma_max ** (1 / rho)
-    sigmas = (max_inv_rho + t * (min_inv_rho - max_inv_rho)) ** rho
+    if float(sigma_max) <= 1.0:
+        sigmas = sigma_max + t * (sigma_min - sigma_max)
+    else:
+        min_inv_rho = sigma_min ** (1 / rho)
+        max_inv_rho = sigma_max ** (1 / rho)
+        sigmas = (max_inv_rho + t * (min_inv_rho - max_inv_rho)) ** rho
     return torch.cat([sigmas, torch.zeros(1, device=device)])
 
 
@@ -195,8 +237,11 @@ def create_logsnr_uniform_sigmas(sigma_max, sigma_min, num_steps, device='cpu'):
     u = torch.linspace(0, 1, num_steps, device=device)
     log_snr_max = 2 * torch.log(sigma_max)
     log_snr_min = 2 * torch.log(sigma_min)
-    log_snr = log_snr_max + u * (log_snr_min - log_snr_max)
-    sigmas = torch.exp(log_snr / 2)
+    if float(sigma_max) <= 1.0:
+        sigmas = sigma_max + u * (sigma_min - sigma_max)
+    else:
+        log_snr = log_snr_max + u * (log_snr_min - log_snr_max)
+        sigmas = torch.exp(log_snr / 2)
     return torch.cat([sigmas, torch.zeros(1, device=device)])
 
 
@@ -206,9 +251,12 @@ def create_tanh_midboost_sigmas(sigma_max, sigma_min, num_steps, device='cpu', k
     u = torch.linspace(0, 1, num_steps, device=device)
     k_tensor = torch.tensor(k, device=device, dtype=u.dtype)
     t = 0.5 * (torch.tanh(k_tensor * (u - 0.5)) / torch.tanh(k_tensor / 2) + 1.0)
-    min_inv_rho = sigma_min ** (1 / rho)
-    max_inv_rho = sigma_max ** (1 / rho)
-    sigmas = (max_inv_rho + t * (min_inv_rho - max_inv_rho)) ** rho
+    if float(sigma_max) <= 1.0:
+        sigmas = sigma_max + t * (sigma_min - sigma_max)
+    else:
+        min_inv_rho = sigma_min ** (1 / rho)
+        max_inv_rho = sigma_max ** (1 / rho)
+        sigmas = (max_inv_rho + t * (min_inv_rho - max_inv_rho)) ** rho
     return torch.cat([sigmas, torch.zeros(1, device=device)])
 
 
@@ -225,9 +273,12 @@ def create_exponential_tail_sigmas(sigma_max, sigma_min, num_steps, device='cpu'
     tail = pivot_tensor + (1 - pivot_tensor) * (tail_raw / (1 - torch.exp(-beta_tensor)))
     t = torch.where(u < pivot_tensor, front, tail)
 
-    min_inv_rho = sigma_min ** (1 / rho)
-    max_inv_rho = sigma_max ** (1 / rho)
-    sigmas = (max_inv_rho + t * (min_inv_rho - max_inv_rho)) ** rho
+    if float(sigma_max) <= 1.0:
+        sigmas = sigma_max + t * (sigma_min - sigma_max)
+    else:
+        min_inv_rho = sigma_min ** (1 / rho)
+        max_inv_rho = sigma_max ** (1 / rho)
+        sigmas = (max_inv_rho + t * (min_inv_rho - max_inv_rho)) ** rho
     return torch.cat([sigmas, torch.zeros(1, device=device)])
 
 
@@ -239,9 +290,12 @@ def create_jittered_karras_sigmas(sigma_max, sigma_min, num_steps, device='cpu',
     denom = max(1, num_steps - 1)
     u = (indices + 0.5 + rand).clamp_(0, num_steps - 1) / denom
 
-    min_inv_rho = sigma_min ** (1 / rho)
-    max_inv_rho = sigma_max ** (1 / rho)
-    sigmas = (max_inv_rho + u * (min_inv_rho - max_inv_rho)) ** rho
+    if float(sigma_max) <= 1.0:
+        sigmas = sigma_max + u * (sigma_min - sigma_max)
+    else:
+        min_inv_rho = sigma_min ** (1 / rho)
+        max_inv_rho = sigma_max ** (1 / rho)
+        sigmas = (max_inv_rho + u * (min_inv_rho - max_inv_rho)) ** rho
 
     sigmas, _ = torch.sort(sigmas, descending=True)
     return torch.cat([sigmas, torch.zeros(1, device=device)])
@@ -270,11 +324,17 @@ def create_stochastic_sigmas(sigma_max, sigma_min, num_steps, device='cpu', nois
 
     u_stochastic = torch.clamp(u_base + perturbation, 0.0, 1.0)
 
-    min_inv_rho = sigma_min ** (1 / rho)
-    max_inv_rho = sigma_max ** (1 / rho)
-    sigmas = (max_inv_rho + u_stochastic * (min_inv_rho - max_inv_rho)) ** rho
+    if float(sigma_max) <= 1.0:
+        sigmas = sigma_max + u_stochastic * (sigma_min - sigma_max)
+    else:
+        min_inv_rho = sigma_min ** (1 / rho)
+        max_inv_rho = sigma_max ** (1 / rho)
+        sigmas = (max_inv_rho + u_stochastic * (min_inv_rho - max_inv_rho)) ** rho
 
     sigmas, _ = torch.sort(sigmas, descending=True)
+    for i in range(1, len(sigmas)):
+        if sigmas[i] >= sigmas[i - 1]:
+            sigmas[i] = sigmas[i - 1] * 0.999
     return torch.cat([sigmas, torch.zeros(1, device=device)])
 
 
@@ -290,24 +350,27 @@ def create_jys_sigmas(sigma_max, sigma_min, num_steps, device='cpu'):
     normalized_timesteps = [(1000 - t) / 1000.0 for t in jys_timesteps]
     t_tensor = torch.tensor(normalized_timesteps, device=device, dtype=torch.float32)
 
-    min_inv_rho = sigma_min ** (1 / rho)
-    max_inv_rho = sigma_max ** (1 / rho)
-    sigmas = (max_inv_rho + t_tensor * (min_inv_rho - max_inv_rho)) ** rho
+    if float(sigma_max) <= 1.0:
+        sigmas = sigma_max + t_tensor * (sigma_min - sigma_max)
+    else:
+        min_inv_rho = sigma_min ** (1 / rho)
+        max_inv_rho = sigma_max ** (1 / rho)
+        sigmas = (max_inv_rho + t_tensor * (min_inv_rho - max_inv_rho)) ** rho
 
     sigmas, _ = torch.sort(sigmas, descending=True)
     return torch.cat([sigmas, torch.zeros(1, device=device)])
 
 
 def _compute_jys_timesteps(num_steps):
-    """Dynamically compute optimized JYS timestep sequence."""
+    """Dynamically compute optimized JYS timestep sequence of exactly num_steps values."""
     if num_steps <= 0:
-        return [0]
+        return []
     if num_steps == 1:
-        return [1000, 0]
+        return [1000]
     elif num_steps == 2:
-        return [1000, 500, 0]
+        return [1000, 500]
     elif num_steps == 3:
-        return [1000, 600, 200, 0]
+        return [1000, 600, 200]
 
     early_steps = max(1, int(num_steps * 0.2))
     final_steps = max(1, int(num_steps * 0.2))
@@ -361,9 +424,6 @@ def _compute_jys_timesteps(num_steps):
     if len(unique_timesteps) > num_steps:
         unique_timesteps = unique_timesteps[:num_steps]
 
-    if unique_timesteps[-1] != 0:
-        unique_timesteps.append(0)
-
     return unique_timesteps
 
 
@@ -384,9 +444,12 @@ def create_hybrid_jys_karras_sigmas(sigma_max, sigma_min, num_steps, device='cpu
     jitter = jitter_seed * jitter_strength / denom
     u = torch.clamp(base + jitter, 0.0, 1.0)
 
-    min_inv_rho = sigma_min ** (1 / rho)
-    max_inv_rho = sigma_max ** (1 / rho)
-    karras_sigmas = (max_inv_rho + u * (min_inv_rho - max_inv_rho)) ** rho
+    if float(sigma_max) <= 1.0:
+        karras_sigmas = sigma_max + u * (sigma_min - sigma_max)
+    else:
+        min_inv_rho = sigma_min ** (1 / rho)
+        max_inv_rho = sigma_max ** (1 / rho)
+        karras_sigmas = (max_inv_rho + u * (min_inv_rho - max_inv_rho)) ** rho
 
     positions = torch.linspace(0, 1, num_steps, device=device)
     jys_weight = torch.empty_like(positions)
@@ -437,41 +500,49 @@ def create_ays_sdxl_sigmas(sigma_max, sigma_min, num_steps, device='cpu'):
              0.0041, 0.0010, 0.0000],
     }
     
-    if num_steps in AYS_SCHEDULES:
-        normalized = torch.tensor(AYS_SCHEDULES[num_steps], device=device, dtype=torch.float32)
-    else:
-        available_steps = sorted(AYS_SCHEDULES.keys())
-        
-        if num_steps < available_steps[0]:
-            ref_steps = available_steps[0]
-        elif num_steps > available_steps[-1]:
-            ref_steps = available_steps[-1]
-        else:
-            ref_steps = min([s for s in available_steps if s >= num_steps], default=available_steps[-1])
-        
-        ref_schedule = np.array(AYS_SCHEDULES[ref_steps])
-        
-        t_ref = np.linspace(0, 1, len(ref_schedule))
-        t_new = np.linspace(0, 1, num_steps + 1)
-        
-        log_ref = np.log(ref_schedule + 1e-8)
-        log_ref[-1] = log_ref[-2] - 3.0
-        
-        log_interp = np.interp(t_new, t_ref, log_ref)
-        normalized_np = np.exp(log_interp)
-        normalized_np[-1] = 0.0
-        
-        normalized = torch.tensor(normalized_np, device=device, dtype=torch.float32)
-    
     sigma_range = sigma_max - sigma_min
+
+    if num_steps in AYS_SCHEDULES:
+        # AYS_SCHEDULES[n] has n entries (including trailing 0.0000 as terminal).
+        # Treat 0.0000 → sigma_min (the last active sigma), then append terminal zero.
+        normalized = torch.tensor(AYS_SCHEDULES[num_steps], device=device, dtype=torch.float32)
+        sigmas = normalized * sigma_range + sigma_min  # num_steps elements
+        sigmas[0] = sigma_max
+        for i in range(1, len(sigmas)):
+            if sigmas[i] >= sigmas[i - 1]:
+                sigmas[i] = sigmas[i - 1] * 0.999
+        return torch.cat([sigmas, torch.zeros(1, device=device)])
+
+    # Interpolation path: produces num_steps + 1 elements directly.
+    available_steps = sorted(AYS_SCHEDULES.keys())
+    if num_steps < available_steps[0]:
+        ref_steps = available_steps[0]
+    elif num_steps > available_steps[-1]:
+        ref_steps = available_steps[-1]
+    else:
+        ref_steps = min(s for s in available_steps if s >= num_steps)
+
+    ref_schedule = torch.tensor(AYS_SCHEDULES[ref_steps], device=device, dtype=torch.float32)
+    log_ref = torch.log(ref_schedule.clamp(min=1e-8))
+    log_ref[-1] = log_ref[-2] - 3.0
+
+    t_ref = torch.linspace(0, 1, len(ref_schedule), device=device)
+    t_new = torch.linspace(0, 1, num_steps + 1, device=device)
+
+    idx = torch.searchsorted(t_ref, t_new).clamp(1, len(t_ref) - 1)
+    lo, hi = idx - 1, idx
+    frac = (t_new - t_ref[lo]) / (t_ref[hi] - t_ref[lo]).clamp(min=1e-12)
+    log_interp = log_ref[lo] + frac * (log_ref[hi] - log_ref[lo])
+    normalized = torch.exp(log_interp)
+    normalized[-1] = 0.0
+
     sigmas = normalized * sigma_range + sigma_min
-    
     sigmas[0] = sigma_max
     sigmas[-1] = 0.0
 
     for i in range(1, len(sigmas) - 1):
-        if sigmas[i] >= sigmas[i-1]:
-            sigmas[i] = sigmas[i-1] * 0.999
+        if sigmas[i] >= sigmas[i - 1]:
+            sigmas[i] = sigmas[i - 1] * 0.999
 
     return sigmas
 
@@ -515,10 +586,12 @@ def create_aos_akashic_alt_sigmas(sigma_max, sigma_min, num_steps, device='cpu')
     if u_max - u_min > 1e-8:
         u_modulated = (u_modulated - u_min) / (u_max - u_min)
 
-    # Karras sigma mapping: linear interpolation in sigma^(1/rho) space
-    min_inv_rho = sigma_min ** (1 / rho)
-    max_inv_rho = sigma_max ** (1 / rho)
-    sigmas = (max_inv_rho + u_modulated * (min_inv_rho - max_inv_rho)) ** rho
+    if float(sigma_max) <= 1.0:
+        sigmas = sigma_max + u_modulated * (sigma_min - sigma_max)
+    else:
+        min_inv_rho = sigma_min ** (1 / rho)
+        max_inv_rho = sigma_max ** (1 / rho)
+        sigmas = (max_inv_rho + u_modulated * (min_inv_rho - max_inv_rho)) ** rho
 
     # Step ratio smoothing for multi-step solver stability
     max_ratio = 1.5

@@ -18,6 +18,9 @@ from .utils import (
     apply_combat_cfg_drift,
     apply_cfg_techniques,
     adaptive_noise_step,
+    compute_adaptive_noise_scale,
+    compute_binned_corrections,
+    get_phase_correction,
     TORCHVISION_AVAILABLE,
 )
 
@@ -617,7 +620,6 @@ def sample_akashic_solver(model, x, sigmas, extra_args=None, callback=None, disa
 
             if adaptive_correction is not None:
                 # Post-restart: apply calibrated correction
-                from .utils import get_phase_correction
                 if adaptive_bin_corrections is not None:
                     correction = get_phase_correction(sigma_val, adaptive_bin_corrections, adaptive_correction)
                     effective_s_noise *= correction
@@ -625,7 +627,6 @@ def sample_akashic_solver(model, x, sigmas, extra_args=None, callback=None, disa
                     effective_s_noise *= adaptive_correction
 
             elif change_norm is not None and prev_change_norm is not None:
-                from .utils import compute_adaptive_noise_scale, compute_binned_corrections
                 change_ratio = change_norm / (prev_change_norm + 1e-8)
                 sigma_ratio = sigma_next_val / (sigma_val + 1e-8)
                 excess = change_ratio / (sigma_ratio + 1e-8)
